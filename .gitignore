@@ -1,0 +1,10 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+.streamlit/secrets.toml
+.cache/
+.freebuff/
+.DS_Store
+data/
+runs/

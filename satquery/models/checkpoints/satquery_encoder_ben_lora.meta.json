@@ -1,0 +1,91 @@
+{
+  "encoder": "satquery RS ViT-B/16 (compact)",
+  "method": "LoRA (rank 8, alpha 16.0)",
+  "injected_modules": [
+    "block0.self_attn.out_proj",
+    "block0.linear1",
+    "block0.linear2",
+    "block1.self_attn.out_proj",
+    "block1.linear1",
+    "block1.linear2",
+    "block2.self_attn.out_proj",
+    "block2.linear1",
+    "block2.linear2",
+    "block3.self_attn.out_proj",
+    "block3.linear1",
+    "block3.linear2"
+  ],
+  "dataset": "BigEarthNetDataset",
+  "labels": [
+    "Urban fabric",
+    "Industrial or commercial units",
+    "Arable land",
+    "Permanent crops",
+    "Pastures",
+    "Complex cultivation patterns",
+    "Agriculture with natural vegetation",
+    "Broad-leaved forest",
+    "Coniferous forest",
+    "Natural grassland",
+    "Moors and heathland",
+    "Sclerophyllous vegetation",
+    "Transitional woodland/shrub",
+    "Bare rock",
+    "Sparsely vegetated areas",
+    "Burnt areas",
+    "Inland waters",
+    "Marine waters",
+    "Coastal wetlands"
+  ],
+  "history": [
+    {
+      "epoch": 1,
+      "train_loss": 0.301561782250599,
+      "val_loss": 0.2692613850037257,
+      "val_acc@3": 0.9557
+    },
+    {
+      "epoch": 2,
+      "train_loss": 0.26018086876593477,
+      "val_loss": 0.2602735170812318,
+      "val_acc@3": 0.9659
+    },
+    {
+      "epoch": 3,
+      "train_loss": 0.2508708594911763,
+      "val_loss": 0.2454971174399058,
+      "val_acc@3": 0.9725
+    },
+    {
+      "epoch": 4,
+      "train_loss": 0.23761068446701075,
+      "val_loss": 0.2353028677629702,
+      "val_acc@3": 0.9782
+    },
+    {
+      "epoch": 5,
+      "train_loss": 0.22995265639152657,
+      "val_loss": 0.22906981137665836,
+      "val_acc@3": 0.982
+    }
+  ],
+  "config": {
+    "bigearthnet_root": "data/BEN14K_materialized",
+    "out_dir": "satquery/models/checkpoints",
+    "epochs": 5,
+    "batch_size": 32,
+    "lr": 0.0002,
+    "lora_rank": 8,
+    "lora_alpha": 16.0,
+    "weight_decay": 0.01,
+    "val_fraction": 0.1,
+    "num_workers": 0,
+    "seed": 42,
+    "patch_size": 120,
+    "max_samples": null,
+    "amp": true,
+    "log_every": 20,
+    "channels": 4,
+    "synthetic_samples": 256
+  }
+}

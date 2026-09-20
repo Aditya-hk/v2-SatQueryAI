@@ -1,0 +1,13 @@
+# SatQuery AI — Streamlit theme (SIH-167)
+# Dark "ground-station" theme: satellite imagery pops against deep blues.
+
+[theme]
+base = "dark"
+primaryColor = "#4f8cff"
+backgroundColor = "#0d1424"
+secondaryBackgroundColor = "#161f34"
+textColor = "#e8edf7"
+font = "sans serif"
+
+[theme.sidebar]
+secondaryBackgroundColor = "#121a2d"
