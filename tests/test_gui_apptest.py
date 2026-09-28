@@ -25,13 +25,23 @@ CAPTION_QUERY = "Describe the land cover and major objects visible in this image
 GROUNDING_QUERY = "Highlight the water body referred to in the query."
 
 
-def _run_app(demo_scene: str, query: str) -> AppTest:
+def _boot_console() -> AppTest:
+    """Boot the app and press *Launch* on the welcome landing page."""
     at = AppTest.from_file(APP_SCRIPT, default_timeout=120)
     at.run()
     assert not at.exception, at.exception
+    launch = [b for b in at.button if "Launch SatQuery console" in b.label]
+    assert launch, "launch button missing on the welcome landing page"
+    launch[0].click().run()
+    assert not at.exception, at.exception
+    return at
 
-    # select the demo scene
-    scene_select = at.sidebar.selectbox[0]
+
+def _run_app(demo_scene: str, query: str) -> AppTest:
+    at = _boot_console()
+
+    # select the demo scene (the input deck lives on the main page, no side panel)
+    scene_select = at.selectbox[0]
     scene_select.set_value(demo_scene).run()
     assert not at.exception, at.exception
 
@@ -56,11 +66,45 @@ def _rendered_text(at: AppTest) -> str:
     return "\n".join(str(part) for part in parts)
 
 
-def test_app_boots_to_empty_state():
+def test_app_boots_to_welcome_landing():
+    """Stage 1: the welcome landing renders and mounts no console widgets."""
     at = AppTest.from_file(APP_SCRIPT, default_timeout=120)
     at.run()
     assert not at.exception, at.exception
-    assert at.sidebar.selectbox[0].value == "-"
+    assert not at.selectbox, "console inputs must not mount before Launch"
+    assert not at.radio, "console inputs must not mount before Launch"
+    assert not at.sidebar.radio, "nothing may be pushed into a side panel"
+    blob = _rendered_text(at)
+    assert "Welcome to" in blob
+    assert any("Launch SatQuery console" in b.label for b in at.button)
+
+
+def test_launch_opens_console_on_main_page():
+    """Stage 2: Launch mounts the whole console on the main page."""
+    at = _boot_console()
+    assert at.selectbox[0].value == "-"
+    assert at.radio[0].value == "Demo scenes"
+    assert not at.sidebar.radio and not at.sidebar.selectbox
+    # console is open but empty: it asks for an input source, no query bar yet
+    assert "Console ready" in _rendered_text(at)
+    assert not any("Run agentic analysis" in b.label for b in at.button)
+
+    # loading a demo scene completes the console: query bar + run button appear
+    at.selectbox[0].set_value(SINGLE_OPTICAL).run()
+    assert not at.exception, at.exception
+    assert any("Run agentic analysis" in b.label for b in at.button)
+
+
+def test_welcome_cta_jumps_into_bi_temporal_demo():
+    """The landing quick-start CTAs bypass the picker and open a workflow."""
+    at = AppTest.from_file(APP_SCRIPT, default_timeout=120)
+    at.run()
+    cta = [b for b in at.button if "Load a demo scene" in b.label]
+    assert cta, "landing quick-start CTA missing"
+    cta[0].click().run()
+    assert not at.exception, at.exception
+    assert at.radio[0].value == "Demo scenes"
+    assert len(at.session_state["images"]) == 2
 
 
 @pytest.mark.parametrize(

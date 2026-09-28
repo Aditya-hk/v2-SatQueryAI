@@ -54,7 +54,7 @@ st.set_page_config(
     page_title="SatQuery AI - Agentic Remote Sensing Framework",
     page_icon="🛰️",
     layout="wide",
-    initial_sidebar_state="auto",
+    initial_sidebar_state="collapsed",
 )
 
 from satquery import APP_NAME, APP_VERSION, PROBLEM_STATEMENT_ID
@@ -636,25 +636,74 @@ def loading_html(message: str = "Agentic pipeline running") -> str:
     )
 
 
+def _launch() -> None:
+    """Welcome CTA: open the main SatQuery console."""
+    st.session_state["launched"] = True
+
+
+def _to_welcome() -> None:
+    """Console CTA: return to the welcome landing page."""
+    st.session_state["launched"] = False
+
+
 def _cta_demo() -> None:
-    """Landing CTA: preselect the bi-temporal demo pair (sets widget keys before
-    their widgets are instantiated on the next run — callbacks are the safe place)."""
+    """Welcome CTA: jump straight into the bi-temporal demo pair (widget keys are
+    set before their widgets are instantiated on the next run — callbacks are the
+    safe place to seed them)."""
+    st.session_state["launched"] = True
     st.session_state["input_mode"] = "Demo scenes"
     st.session_state["demo_select"] = "Bi-temporal pair (2023 vs 2024)"
 
 
 def _cta_map() -> None:
-    """Landing CTA: switch the sidebar to live map acquisition."""
+    """Welcome CTA: jump straight into live map acquisition."""
+    st.session_state["launched"] = True
     st.session_state["input_mode"] = "Map region (live imagery)"
 
 
 def _cta_upload() -> None:
-    """Landing CTA: switch the sidebar to file upload."""
+    """Welcome CTA: jump straight into file upload."""
+    st.session_state["launched"] = True
     st.session_state["input_mode"] = "Upload images"
 
 
-def render_landing() -> None:
-    """Animated landing stage for the true empty state (no imagery loaded)."""
+def _capability_cells() -> None:
+    """The three console entry points, rendered as an animated card row."""
+    st.markdown(
+        """
+        <div class='sq-empty'>
+          <div class='cell'><div class='ico'>🗺️</div><h4>Map region</h4>
+            <p>Draw a rectangle anywhere on Earth and fetch live Sentinel-2 /
+            Sentinel-1 imagery for exactly that footprint.</p></div>
+          <div class='cell'><div class='ico'>🧪</div><h4>Demo scenes</h4>
+            <p>Offline georeferenced samples for every workflow — no network
+            needed for the full demo.</p></div>
+          <div class='cell'><div class='ico'>📂</div><h4>Upload images</h4>
+            <p>Your own GeoTIFF / TIFF (geospatial) or PNG / JPEG (benchmark)
+            files, up to two at a time.</p></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def _example_strip() -> None:
+    """Example natural-language queries, shown as a subtle hint strip."""
+    st.markdown(
+        "<div class='sq-example'>Then ask: <i>“Describe the land cover and major objects "
+        "visible in this image.”</i> · <i>“What changed between these two dates?”</i> · "
+        "<i>“Use the optical and SAR images together to identify built-up and "
+        "water-covered regions.”</i></div>",
+        unsafe_allow_html=True,
+    )
+
+
+def render_welcome() -> None:
+    """Stage 1 — the animated welcome landing shown before the console opens.
+
+    No console widget (input source, map, uploader, query bar) is rendered here:
+    the operator presses *Launch* and the full workspace opens on the main page.
+    """
     try:
         tool_count = len(default_registry().describe().get("tools", []))
     except Exception:  # never let a cosmetic stat break the page
@@ -692,7 +741,7 @@ def render_landing() -> None:
             <div class='sq-badge'><span class='dot'></span>
               {PROBLEM_STATEMENT_ID} · agentic multi-modal remote sensing
             </div>
-            <div class='sq-h1'>Ask your satellite imagery<br>anything.</div>
+            <div class='sq-h1'>Welcome to<br>SatQuery AI.</div>
             <p class='sq-lead'>Optical, multispectral, SAR and bi-temporal pairs — one agentic
             console that validates the inputs, classifies the intent, routes the question to
             specialist models, and answers with visual evidence, a confidence score and a
@@ -715,23 +764,14 @@ def render_landing() -> None:
         unsafe_allow_html=True,
     )
 
-    st.markdown("#### 👈 Pick an input source to begin")
-    st.markdown(
-        """
-        <div class='sq-empty'>
-          <div class='cell'><div class='ico'>🗺️</div><h4>Map region</h4>
-            <p>Draw a rectangle anywhere on Earth and fetch live Sentinel-2 /
-            Sentinel-1 imagery for exactly that footprint.</p></div>
-          <div class='cell'><div class='ico'>🧪</div><h4>Demo scenes</h4>
-            <p>Offline georeferenced samples for every workflow — no network
-            needed for the full demo.</p></div>
-          <div class='cell'><div class='ico'>📂</div><h4>Upload images</h4>
-            <p>Your own GeoTIFF / TIFF (geospatial) or PNG / JPEG (benchmark)
-            files, up to two at a time.</p></div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    launch_l, launch_m, launch_r = st.columns([2, 3, 2])
+    launch_m.button("🚀 Launch SatQuery console", type="primary", width="stretch",
+                    on_click=_launch,
+                    help="Open the full agentic console: inputs, map, query bar and reports.")
+
+    st.markdown("#### Inside the console")
+    _capability_cells()
+    st.markdown("#### Or jump straight into a workflow")
     cta = st.columns(3)
     cta[0].button("🧪 Load a demo scene", width="stretch",
                   on_click=_cta_demo, help="Instantly load the bi-temporal demo pair.")
@@ -739,13 +779,19 @@ def render_landing() -> None:
                   on_click=_cta_map, help="Switch to live Sentinel imagery for a drawn ROI.")
     cta[2].button("📂 Upload imagery", width="stretch",
                   on_click=_cta_upload, help="Analyse your own GeoTIFF / PNG files.")
-    st.markdown(
-        "<div class='sq-example'>Then ask: <i>“Describe the land cover and major objects "
-        "visible in this image.”</i> · <i>“What changed between these two dates?”</i> · "
-        "<i>“Use the optical and SAR images together to identify built-up and "
-        "water-covered regions.”</i></div>",
-        unsafe_allow_html=True,
+    _example_strip()
+
+
+def render_console_start() -> None:
+    """Stage 2 placeholder — the console is open but no imagery is loaded yet."""
+    st.markdown("#### Console ready — choose an input source above")
+    _capability_cells()
+    st.caption(
+        "Single image → VQA, captioning and text-guided region grounding · "
+        "bi-temporal pair → change description, change-VQA and a spatial change map · "
+        "optical + SAR pair → joint spectral + structural fusion."
     )
+    _example_strip()
 
 
 def load_uploads(files: List[Any], controller: AgentController) -> Tuple[List[RasterImage], List[str]]:
@@ -825,6 +871,7 @@ def init_session() -> None:
     ss.setdefault("fetch_warnings", [])
     ss.setdefault("result_map", None)              # folium map for result overlay
     ss.setdefault("result_map_geo", None)          # bbox of result map images
+    ss.setdefault("launched", False)               # welcome landing -> console gate
 
 
 def _acquire_from_map(bbox: Tuple[float, float, float, float], start: date, end: date,
@@ -849,16 +896,28 @@ init_session()
 inject_theme_css()
 
 
-# ------------------------------------------------------------------ sidebar ---
-with st.sidebar:
-    st.markdown(f"## 🛰️ {APP_NAME}")
-    st.caption(f"SIH Problem Statement {PROBLEM_STATEMENT_ID} · v{APP_VERSION}")
+# -------------------------------------------------------------- launch gate --
+# Stage 1 is the welcome landing; the console only mounts after *Launch*.
+if not st.session_state.launched:
+    render_welcome()
+    st.stop()
 
-    _sec("01", "Inputs", "select the source")
+
+# -------------------------------------------------------------- control deck --
+def render_control_deck() -> None:
+    """All input acquisition, rendered on the main page (nothing lives in a
+    side panel).
+
+    Covers every SIH input scope — offline georeferenced demo scenes, a live
+    Sentinel-2 / Sentinel-1 map ROI, and user uploads — then reports the active
+    inputs with their sensor metadata.
+    """
+    _sec("01", "Inputs", "demo scenes · live Sentinel map ROI · your own files")
     input_mode = st.radio(
         "Input source",
         ["Demo scenes", "Map region (live imagery)", "Upload images"],
         key="input_mode",
+        horizontal=True,
         help="Draw a region on the map to pull real Sentinel-2/Sentinel-1 imagery, "
              "load offline demo scenes, or upload your own GeoTIFF/PNG/JPEG files.",
     )
@@ -884,7 +943,11 @@ with st.sidebar:
         if not HAS_FOLIUM_UI:
             st.error("folium / streamlit-folium are not installed; map input is unavailable.")
         if HAS_FOLIUM_UI:
-            st.caption("Draw a rectangle ⬚ on the map, pick dates, then fetch.")
+            st.caption(
+                "Draw a rectangle ⬚ on the map, pick the acquisition window, then fetch. "
+                "The search looks ±7 days around each date and widens automatically when that "
+                "window is empty (typically 10-40 s)."
+            )
             roi_center = DEFAULT_MAP_CENTER
             fmap = folium.Map(location=roi_center, zoom_start=5, tiles="OpenStreetMap",
                               control_scale=True)
@@ -895,7 +958,7 @@ with st.sidebar:
                 edit_options={"edit": False, "remove": False},
             ).add_to(fmap)
             map_event = st_folium(
-                fmap, height=340, width=None, use_container_width=True,
+                fmap, height=460, width=None, use_container_width=True,
                 returned_objects=["last_active_drawing"], key="roi_map",
             )
             drawing = (map_event or {}).get("last_active_drawing") or {}
@@ -914,16 +977,20 @@ with st.sidebar:
             else:
                 st.info("No ROI drawn yet — use the ⬚ rectangle tool on the map.")
 
-            c1, c2 = st.columns(2)
+            c1, c2, c3, c4 = st.columns([1.1, 1.1, 1.2, 1.4])
             roi_start = c1.date_input("T1 (from)", value=date.today() - timedelta(days=180),
                                       key="roi_start")
             roi_end = c2.date_input("T2 (to)", value=date.today() - timedelta(days=15),
                                     key="roi_end")
-            include_sar = st.toggle("Also fetch SAR (Sentinel-1)", value=False, key="roi_sar")
-            fetch_clicked = st.button("🛰️ Fetch imagery for ROI", type="primary", width="stretch",
-                                      disabled=not bbox, key="roi_fetch")
+            with c3:
+                include_sar = st.toggle("Also fetch SAR (Sentinel-1)", value=False,
+                                        key="roi_sar")
+            with c4:
+                fetch_clicked = st.button("🛰️ Fetch imagery for ROI", type="primary",
+                                          width="stretch", disabled=not bbox, key="roi_fetch")
             if fetch_clicked and bbox:
-                _acquire_from_map(bbox, roi_start, roi_end, include_sar)
+                with st.spinner("Searching the Sentinel archive and reading the ROI windows…"):
+                    _acquire_from_map(bbox, roi_start, roi_end, include_sar)
             elif fetch_clicked and not bbox:
                 st.error("Draw a rectangle on the map first.")
             if st.session_state.fetch_warnings:
@@ -932,7 +999,7 @@ with st.sidebar:
 
     else:  # Upload images
         uploads = st.file_uploader(
-            "Or upload images (max 2)",
+            "Upload images (max 2)",
             type=["tif", "tiff", "png", "jpg", "jpeg"],
             accept_multiple_files=True,
         )
@@ -946,54 +1013,55 @@ with st.sidebar:
             st.session_state.images = []
 
     images = st.session_state.images
-    st.markdown(f"**Active inputs:** {len(images)}")
-    for img in images:
-        st.markdown(
-            f"<div class='sq-chip'>📄 <b>{img.metadata.name}</b><br>"
-            f"<span class='dim'>{img.metadata.fmt} · {img.metadata.width}×{img.metadata.height} · "
-            f"{img.metadata.bands} band(s)<br>"
-            f"CRS: {img.metadata.crs or 'missing'} · {img.metadata.modality}</span></div>",
-            unsafe_allow_html=True,
-        )
+    if images:
+        st.markdown(f"**Active inputs · {len(images)} loaded**")
+        chip_cols = st.columns(min(3, len(images)))
+        for index, img in enumerate(images):
+            with chip_cols[index % len(chip_cols)]:
+                st.markdown(
+                    f"<div class='sq-chip'>📄 <b>{_esc(img.metadata.name)}</b><br>"
+                    f"<span class='dim'>{_esc(img.metadata.fmt)} · "
+                    f"{img.metadata.width}×{img.metadata.height} · "
+                    f"{img.metadata.bands} band(s)<br>"
+                    f"CRS: {_esc(img.metadata.crs or 'missing')} · "
+                    f"{_esc(img.metadata.modality)}</span></div>",
+                    unsafe_allow_html=True,
+                )
     for error in st.session_state.upload_errors:
         st.error(error)
     fetched_info = st.session_state.get("fetched_info")
     if fetched_info:
         src = fetched_info.get("source", "")
         if "live" in src:
-            scenes = fetched_info.get("scenes", {})
-            bits = ["🛰️ Live scenes"]
-            for key in ("t1", "t2"):
+            scenes = fetched_info.get("scenes", {}) or {}
+            bits: List[str] = []
+            for key, title in (("t1", "T1"), ("t2", "T2")):
                 sc = scenes.get(key) or {}
-                if sc.get("datetime"):
-                    bits.append(f"{key.upper()} {str(sc['datetime'])[:10]} ({sc.get('platform', 'S2')}, "
-                                f"clouds {sc.get('cloud_cover', 0):.0f}%)")
+                if not sc.get("datetime"):
+                    continue
+                clouds = sc.get("cloud_cover")
+                cloud_txt = f", clouds {float(clouds):.0f}%" if clouds is not None else ""
+                widened = (f" · widened ±{sc.get('search_window_days')}d"
+                           if sc.get("widened") else "")
+                bits.append(f"{title} {str(sc['datetime'])[:10]} "
+                            f"({sc.get('platform', 'S2')}{cloud_txt}){widened}")
             sar_scene = fetched_info.get("sar_scene") or {}
             if sar_scene.get("datetime"):
-                bits.append(f"SAR {str(sar_scene['datetime'])[:10]} ({sar_scene.get('platform', 'S1')})")
+                bits.append(f"SAR {str(sar_scene['datetime'])[:10]} "
+                            f"({sar_scene.get('platform', 'S1')})")
             st.markdown(
-                "<div class='sq-srcstrip'>"
-                + "".join(f"<span class='tag'>{b}</span>" for b in bits)
+                "<div class='sq-srcstrip'><span class='tag'>🛰️ Live Sentinel acquisition</span>"
+                + "".join(f"<span class='tag'>{_esc(b)}</span>" for b in bits)
                 + "</div>",
                 unsafe_allow_html=True,
             )
         elif src == "synthetic-fallback":
-            st.markdown("<div class='sq-srcstrip'><span class='tag'>🧪 Offline fallback scene "
-                        "(catalog unreachable)</span></div>", unsafe_allow_html=True)
-
-    _sec("02", "Run", "agent + session")
-    auto_reproject = st.toggle("Auto-reproject CRS-mismatched pairs", value=True)
-    if st.button("🧹 Reset session", width="stretch"):
-        for key in ("result", "history", "images", "upload_errors"):
-            st.session_state[key] = None if key == "result" else []
-        st.rerun()
-
-    st.markdown("---")
-    st.caption(
-        "Single image → VQA + captioning/grounding\n\n"
-        "Bi-temporal pair → change analysis\n\n"
-        "Optical + SAR pair → joint fusion"
-    )
+            reason = _clip(fetched_info.get("fallback_reason") or "catalogue unreachable", 170)
+            st.markdown(
+                "<div class='sq-srcstrip'><span class='tag'>🧪 No live scene for this ROI/window "
+                f"— synthetic scene ({_esc(reason)})</span></div>",
+                unsafe_allow_html=True,
+            )
 
 # ------------------------------------------------------------------- header ---
 _HERO_MODES = {
@@ -1017,8 +1085,12 @@ st.markdown(
     unsafe_allow_html=True,
 )
 
+# -------------------------------------------------------------- control deck --
+render_control_deck()
+images = st.session_state.images
+
 if not images:
-    render_landing()
+    render_console_start()
     st.stop()
 
 # ------------------------------------------------------------- validation ----
@@ -1036,6 +1108,20 @@ with st.expander("🧪 Input validation", expanded=False):
         with col:
             st.markdown(f"**{img.metadata.name}**")
             st.json(img.to_dict(), expanded=False)
+
+# --------------------------------------------------------------- run controls --
+_sec("02", "Run", "agent settings · session state")
+run_l, run_m, run_r = st.columns([2, 1, 1])
+auto_reproject = run_l.toggle("Auto-reproject CRS-mismatched pairs", value=True,
+                             help="Reproject a pair whose CRSs differ onto a common grid "
+                                  "before analysis.")
+if run_m.button("🧹 Reset session", width="stretch"):
+    for key in ("result", "history", "images", "upload_errors"):
+        st.session_state[key] = None if key == "result" else []
+    st.rerun()
+run_r.button("⌂ Welcome page", width="stretch", on_click=_to_welcome,
+             help="Return to the SatQuery landing page.")
+
 
 # ----------------------------------------------------------------- query bar --
 EXAMPLES_BY_N: Dict[int, List[str]] = {

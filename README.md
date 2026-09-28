@@ -21,18 +21,24 @@ routes to specialist tools from the **Specialist Model Registry**, estimates a c
 
 ### 🛰️ Live map mode — draw an ROI, pull real satellite imagery
 
-Switch the sidebar to **"Live map — draw ROI & fetch"** to:
+Pick **"Map region (live imagery)"** in the console's input deck to:
 
 * draw a region of interest directly on an interactive world map (rectangle tool),
 * pick T1/T2 dates and toggle optical / SAR sensors,
 * fetch **real Sentinel-2 L2A** (optical) and **Sentinel-1 GRD** (SAR) scenes for exactly that
   footprint from the Microsoft Planetary Computer STAC catalog (signed COG windowed reads —
-  only the ROI is downloaded), and
+  only the ROI is downloaded, four bands per scene read in parallel), and
 * export results as **GeoTIFF** and **GeoJSON** alongside the JSON/PDF reports.
 
-Every acquisition is recorded in the audit trail (source, platform, scene id, cloud cover);
-if the catalog is unreachable the app degrades to a deterministic synthetic scene rendered on
-the requested extent and says so honestly.
+Each epoch is first searched in a ±7-day window under the 30% cloud threshold. If that window
+is empty the search **escalates instead of giving up**: the cloud threshold is relaxed, then
+the window widens to ±30 / ±90 / ±180 / ±365 days, and the pair is forced onto two *distinct*
+acquisitions so change analysis never compares a scene with itself. A SAR failure is downgraded
+to a warning so the optical pair still arrives. Every compromise (relaxed threshold, widened
+window, accepted cloud cover, re-picked second epoch) is written into the auditable execution
+summary. Only when no optical scene exists anywhere in the reach does the app degrade to a
+deterministic synthetic scene rendered on the requested extent — and it reports the exact
+reason and every window it tried.
 
 ---
 

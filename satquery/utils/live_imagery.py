@@ -53,9 +53,33 @@ S1_COLLECTION = "sentinel-1-grd"
 
 #: hard wall-clock budget for the whole live acquisition attempt; when it is
 #: exceeded (e.g. an offline machine silently dropping packets) we fall back
-#: to the synthetic scene instead of hanging the UI.
-LIVE_FETCH_TIMEOUT_S = 60.0
+#: to the synthetic scene instead of hanging the UI. Band reads run in
+#: parallel, so a full optical pair normally completes in well under a minute.
+LIVE_FETCH_TIMEOUT_S = 120.0
 _HTTP_SOCKET_TIMEOUT_S = 15.0
+
+#: Concurrent remote COG window reads (bands per scene / polarisations).
+BAND_WORKERS = 4
+
+#: Search escalation, tried in order until a scene is found. Each entry is
+#: ``(half_window_days, relax_cloud_threshold)``: the requested acquisition is
+#: first looked for in a ``±7``-day window with the cloud threshold applied,
+#: then in the same window ignoring cloud cover, then in progressively wider
+#: windows. A narrow window with a hard cloud cap is the single most common
+#: reason a perfectly covered ROI looked "empty".
+SEARCH_ESCALATION: Tuple[Tuple[int, bool], ...] = (
+    (7, False),
+    (7, True),
+    (30, True),
+    (90, True),
+    (180, True),
+    (365, True),
+)
+
+#: Score bonus (cloud-% equivalent) charged per day a scene sits away from the
+#: requested date, so a clear scene a few days off beats a cloudy one that is
+#: exact.
+DATE_DISTANCE_PENALTY = 0.75
 
 #: Sentinel-2 asset ids assembled in the package's band order (R, G, B, NIR).
 #: Real Sentinel-2 naming: B04 = red (665 nm), B03 = green (560 nm),
@@ -257,64 +281,175 @@ def _read_asset_window(href: str, bbox: BBox, out_h: int, out_w: int) -> np.ndar
     return _resample(data, out_h, out_w)
 
 
-def _pick_item(catalog: Any, collection: str, bbox: BBox, dt_range: str,
-               cloud_max: Optional[float]) -> Tuple[Any, Dict[str, Any]]:
-    search_kwargs: Dict[str, Any] = {
-        "collections": [collection], "bbox": list(bbox), "datetime": dt_range,
-        "max_items": 12,
-    }
-    if cloud_max is not None and collection == S2_COLLECTION:
-        search_kwargs["query"] = {"eo:cloud_cover": {"lt": cloud_max}}
-    items = list(catalog.search(**search_kwargs).items())
-    if not items:
-        raise RuntimeError(f"no {collection} scenes cover the ROI in this window")
-    if collection == S2_COLLECTION:
-        item = min(items, key=lambda it: it.properties.get("eo:cloud_cover", 0.0))
-    else:
-        item = items[-1]
-    props = {
-        "datetime": str(item.properties.get("datetime", "")),
-        "platform": str(item.properties.get("platform", collection)),
-        "cloud_cover": item.properties.get("eo:cloud_cover"),
-        "item_id": str(item.id),
-    }
-    return item, props
+def _parallel(fn: Any, jobs: List[Any], workers: int = BAND_WORKERS) -> List[Any]:
+    """Map ``fn`` over ``jobs`` concurrently, preserving input order."""
+    if len(jobs) <= 1:
+        return [fn(job) for job in jobs]
+    with ThreadPoolExecutor(max_workers=min(workers, len(jobs))) as pool:
+        return list(pool.map(fn, jobs))
 
 
-def _fetch_optical_live(catalog: Any, bbox: BBox, start: date, end: date,
-                        max_dim: int, cloud_max: Optional[float]) -> Tuple[RasterImage, Dict[str, Any]]:
-    item, props = _pick_item(catalog, S2_COLLECTION, bbox, _datetime_range(start, end), cloud_max)
+def _item_day(item: Any) -> Optional[date]:
+    """Acquisition date of a STAC item, if its ``datetime`` parses."""
+    raw = str((item.properties or {}).get("datetime", "") or "").strip()
+    if not raw:
+        return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date()
+    except ValueError:
+        return None
+
+
+def _item_score(item: Any, target: date) -> float:
+    """Ranking score — lower is better. Cloud cover dominates, date distance
+    breaks ties, so the pair stays as close to the requested dates as the
+    archive allows while still preferring clearer acquisitions."""
+    clouds = (item.properties or {}).get("eo:cloud_cover")
+    cloud_term = float(clouds) if clouds is not None else 0.0
+    day = _item_day(item)
+    distance = abs((day - target).days) if day is not None else 0
+    return cloud_term + DATE_DISTANCE_PENALTY * distance
+
+
+def _pick_item(catalog: Any, collection: str, bbox: BBox, target: date,
+               cloud_max: Optional[float], label: str = "scene",
+               exclude_ids: Sequence[str] = (),
+               notes: Optional[List[str]] = None) -> Tuple[Any, Dict[str, Any]]:
+    """Find the best scene for ``target``, widening the search instead of failing.
+
+    Escalates through :data:`SEARCH_ESCALATION`: the requested ±7-day window with
+    the cloud threshold, the same window with the threshold relaxed, then wider
+    windows up to ±365 days. ``exclude_ids`` keeps a bi-temporal pair from
+    collapsing onto a single acquisition. Any compromise made (relaxed cloud
+    threshold, widened window, high cloud cover) is appended to ``notes`` so it
+    surfaces in the auditable acquisition summary.
+    """
+    notes = notes if notes is not None else []
+    today = date.today()
+    attempts: List[str] = []
+    for half, relax_cloud in SEARCH_ESCALATION:
+        win_start = target - timedelta(days=half)
+        win_end = min(target + timedelta(days=half), today)
+        if win_end < win_start:
+            attempts.append(f"±{half}d: window not yet acquired")
+            continue
+        cap = None if relax_cloud else cloud_max
+        if collection != S2_COLLECTION:
+            cap = None
+        search_kwargs: Dict[str, Any] = {
+            "collections": [collection], "bbox": list(bbox),
+            "datetime": _datetime_range(win_start, win_end), "max_items": 12,
+        }
+        if cap is not None:
+            search_kwargs["query"] = {"eo:cloud_cover": {"lt": cap}}
+        try:
+            items = [it for it in catalog.search(**search_kwargs).items()
+                     if str(it.id) not in set(exclude_ids)]
+        except Exception as exc:  # transient catalog/transport failure
+            notes.append(
+                f"catalog search failed for {label} ({win_start}→{win_end}): "
+                f"{type(exc).__name__}: {str(exc)[:120]}"
+            )
+            attempts.append(f"±{half}d: search error")
+            continue
+        if not items:
+            detail = "0 scenes" if cap is None else f"0 scenes under {cap:.0f}% cloud"
+            attempts.append(f"±{half}d {win_start}→{win_end}: {detail}")
+            continue
+
+        item = min(items, key=lambda it: _item_score(it, target))
+        day = _item_day(item)
+        distance = abs((day - target).days) if day is not None else 0
+        clouds = (item.properties or {}).get("eo:cloud_cover")
+        if half > SEARCH_ESCALATION[0][0]:
+            notes.append(
+                f"{label}: no usable scene within ±{SEARCH_ESCALATION[0][0]} days of "
+                f"{target.isoformat()}; nearest acquisition is {distance} day(s) away "
+                f"(searched ±{half} days)."
+            )
+        elif relax_cloud and cloud_max is not None:
+            notes.append(
+                f"{label}: no scene under {cloud_max:.0f}% cloud cover for "
+                f"{target.isoformat()}; cloud threshold relaxed."
+            )
+        if clouds is not None and cloud_max is not None and float(clouds) > cloud_max:
+            notes.append(
+                f"{label}: accepted {float(clouds):.0f}% cloud cover for "
+                f"{target.isoformat()} (above the {cloud_max:.0f}% target)."
+            )
+        props = {
+            "datetime": str(item.properties.get("datetime", "")),
+            "platform": str(item.properties.get("platform", collection)),
+            "cloud_cover": clouds,
+            "item_id": str(item.id),
+            "date": day.isoformat() if day is not None else None,
+            "days_from_target": distance,
+            "search_window_days": half,
+            "search_window": f"{win_start.isoformat()}/{win_end.isoformat()}",
+            "cloud_filter": cap,
+            "widened": half > SEARCH_ESCALATION[0][0],
+        }
+        return item, props
+
+    tried = "; ".join(attempts[-4:]) or "no search windows available"
+    raise RuntimeError(
+        f"no {collection} scenes cover the ROI near {target.isoformat()} "
+        f"(tried ±{SEARCH_ESCALATION[-1][0]} days; {tried})"
+    )
+
+
+def _item_asset_href(item: Any, asset_id: str) -> str:
+    """href of a STAC asset, working for both dict- and object-style assets."""
+    asset = item.assets.get(asset_id) if hasattr(item.assets, "get") else None
+    if asset is None:
+        try:
+            asset = item.assets[asset_id]
+        except Exception:  # pragma: no cover - depends on pystac version
+            asset = None
+    if asset is None:
+        raise RuntimeError(f"asset {asset_id} missing from scene {item.id}")
+    return str(getattr(asset, "href", asset))
+
+
+def _optical_image(item: Any, props: Dict[str, Any], bbox: BBox,
+                   max_dim: int) -> RasterImage:
+    """Read the four optical bands of one scene, concurrently."""
     out_h, out_w = _window_dims(bbox, max_dim)
-
-    bands: List[np.ndarray] = []
-    for asset_id in S2_BAND_ASSETS:
-        if asset_id not in item.assets:
-            raise RuntimeError(f"asset {asset_id} missing from scene {props['item_id']}")
-        bands.append(_read_asset_window(item.assets[asset_id].href, bbox, out_h, out_w))
+    hrefs = [_item_asset_href(item, band) for band in S2_BAND_ASSETS]
+    read = lambda href: _read_asset_window(href, bbox, out_h, out_w)  # noqa: E731
+    bands: List[np.ndarray] = _parallel(read, hrefs)
     data = np.dstack([_stretch(b) for b in bands]).astype(np.float32)
     preview = _true_colour_preview(bands, min(out_h, 720), min(out_w, 720))
     extra = _acquisition_extra(
         "planetary-computer (live)", props["platform"], props["datetime"], "optical",
         cloud_cover=props["cloud_cover"], scene_id=props["item_id"],
         bands="B04,B03,B02,B08 (red,green,blue,nir)",
+        search_window=props.get("search_window"),
+        days_from_target=props.get("days_from_target"),
+        cloud_filter=props.get("cloud_filter"),
+        widened=props.get("widened", False),
     )
-    img = _build_raster(f"s2_optical_{props['datetime'][:10]}.tif", data, bbox, "optical", extra, preview)
-    return img, props
+    return _build_raster(f"s2_optical_{props['datetime'][:10]}.tif", data, bbox,
+                         "optical", extra, preview)
 
 
-def _fetch_sar_live(catalog: Any, bbox: BBox, start: date, end: date,
-                    max_dim: int) -> Tuple[RasterImage, Dict[str, Any]]:
-    item, props = _pick_item(catalog, S1_COLLECTION, bbox, _datetime_range(start, end), None)
+def _fetch_sar_live(catalog: Any, bbox: BBox, target: date, max_dim: int,
+                    label: str = "SAR scene",
+                    notes: Optional[List[str]] = None) -> Tuple[RasterImage, Dict[str, Any]]:
+    item, props = _pick_item(catalog, S1_COLLECTION, bbox, target, None, label,
+                             (), notes)
     out_h, out_w = _window_dims(bbox, max_dim)
 
     pols: List[np.ndarray] = []
     for pol in S1_POLARISATIONS:
-        if pol not in item.assets:
+        try:
+            href = _item_asset_href(item, pol)
+        except RuntimeError:
             if pol == "vv":
-                raise RuntimeError(f"VV asset missing from scene {props['item_id']}")
+                raise
             continue
-        amp = _read_asset_window(item.assets[pol].href, bbox, out_h, out_w)
-        amp = np.nan_to_num(amp, nan=0.0, posinf=0.0, neginf=0.0)
+        amp = np.nan_to_num(_read_asset_window(href, bbox, out_h, out_w),
+                            nan=0.0, posinf=0.0, neginf=0.0)
         db = 10.0 * np.log10(np.maximum(amp, 1e-6) ** 2)
         lo, hi = SAR_DB_RANGE
         pols.append(np.clip((db - lo) / (hi - lo), 0.0, 1.0).astype(np.float32))
@@ -326,7 +461,11 @@ def _fetch_sar_live(catalog: Any, bbox: BBox, start: date, end: date,
     extra = _acquisition_extra(
         "planetary-computer (live)", props["platform"], props["datetime"], "sar",
         polarisations="+".join(S1_POLARISATIONS[: len(pols)]),
-        scene_id=props["item_id"], note="dB-normalised backscatter, VV/VH",
+        scene_id=props["item_id"],        note="dB-normalised backscatter, VV/VH",
+        search_window=props.get("search_window"),
+        days_from_target=props.get("days_from_target"),
+        cloud_filter=props.get("cloud_filter"),
+        widened=props.get("widened", False),
     )
     img = _build_raster(f"s1_sar_{props['datetime'][:10]}.tif", data, bbox, "sar", extra, preview)
     return img, props
@@ -378,19 +517,57 @@ def _synthetic_pair(bbox: BBox, start: date, end: date, include_sar: bool,
 # ----------------------------------------------------------------- main API ---
 def _live_attempt(box: BBox, start: date, end: date, include_sar: bool,
                   max_dim: int, cloud_max: Optional[float]) -> Tuple[List[RasterImage], Dict[str, Any], Optional[Dict[str, Any]]]:
-    """One live-acquisition attempt; raises on any network/catalog failure."""
+    """One live-acquisition attempt.
+
+    Raises only when no optical scene can be found for either epoch; a SAR
+    failure is downgraded to a warning so the operator still gets the optical
+    pair instead of a synthetic scene.
+    """
     catalog = _mpc_catalog()
-    images: List[RasterImage] = []
-    t1, p1 = _fetch_optical_live(catalog, box, start, start + timedelta(days=14), max_dim, cloud_max)
-    images.append(t1)
-    t2, p2 = _fetch_optical_live(catalog, box, end - timedelta(days=14), end, max_dim, cloud_max)
-    images.append(t2)
-    scenes_info = {"scenes": {"t1": p1, "t2": p2}}
+    notes: List[str] = []
+
+    # Both epochs are searched concurrently, then the pair is forced onto
+    # distinct acquisitions so change analysis never compares a scene with
+    # itself.
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        t1_job = pool.submit(_pick_item, catalog, S2_COLLECTION, box, start,
+                             cloud_max, "T1 (earlier)", (), notes)
+        t2_job = pool.submit(_pick_item, catalog, S2_COLLECTION, box, end,
+                             cloud_max, "T2 (later)", (), notes)
+        item1, p1 = t1_job.result()
+        item2, p2 = t2_job.result()
+
+    if str(item1.id) == str(item2.id):
+        try:
+            item2, p2 = _pick_item(catalog, S2_COLLECTION, box, end, cloud_max,
+                                   "T2 (later)", (str(item1.id),), notes)
+            notes.append(f"T2 re-picked as {p2['item_id']} so the pair is genuinely bi-temporal.")
+        except RuntimeError:
+            notes.append(
+                f"Only one acquisition covers this ROI near the requested dates — T1 and "
+                f"T2 are the same scene ({item1.id}); widen the date range for real change."
+            )
+
+    t1, t2 = _parallel(
+        lambda job: _optical_image(*job),
+        [(item1, p1, box, max_dim), (item2, p2, box, max_dim)],
+        workers=2,
+    )
+
+    images: List[RasterImage] = [t1, t2]
     sar_info: Optional[Dict[str, Any]] = None
     if include_sar:
-        sar, ps = _fetch_sar_live(catalog, box, end - timedelta(days=14), end, max_dim)
-        images.append(sar)
-        sar_info = ps
+        try:
+            sar, ps = _fetch_sar_live(catalog, box, end, max_dim, "SAR scene", notes)
+            images.append(sar)
+            sar_info = ps
+        except Exception as exc:  # noqa: BLE001 - SAR is optional, never fatal
+            logger.warning("SAR acquisition failed: %s", exc)
+            notes.append(
+                f"SAR acquisition failed ({type(exc).__name__}: {str(exc)[:120]}); "
+                "returning the optical pair only."
+            )
+    scenes_info: Dict[str, Any] = {"scenes": {"t1": p1, "t2": p2}, "notes": notes}
     return images, scenes_info, sar_info
 
 
@@ -405,6 +582,20 @@ def fetch_roi_imagery(bbox: Sequence[float], start: date, end: date,
     cross-modal fusion.
     """
     box = validate_bbox(bbox)
+    today = date.today()
+    future_note: Optional[str] = None
+    if start > today:
+        raise ValueError(
+            f"The requested window starts {start.isoformat()}, which is in the future "
+            f"(today is {today.isoformat()}); the Sentinel archive has no such "
+            "acquisitions yet. Pick an earlier start date."
+        )
+    if end > today:
+        future_note = (
+            f"Requested end date {end.isoformat()} is in the future; clamped to "
+            f"{today.isoformat()} — the archive ends there."
+        )
+        end = today
     if end < start:
         raise ValueError("The end date must be on or after the start date.")
     result = LiveFetchResult(info={
@@ -421,11 +612,17 @@ def fetch_roi_imagery(bbox: Sequence[float], start: date, end: date,
             socket.setdefaulttimeout(old_timeout)
         result.images = list(catalog)
         result.info.update(scenes_info)
+        # every compromise the search had to make is reported, not swallowed
+        for note in scenes_info.get("notes") or []:
+            result.warnings.append(str(note))
+            logger.info("live acquisition note: %s", note)
         if sar_info:
             result.info["sar_scene"] = sar_info
     except Exception as exc:  # noqa: BLE001 - network/catalog failures are expected
         logger.warning("live acquisition failed: %s", exc)
-        result.warnings.append(f"Live catalog unavailable ({type(exc).__name__}: {str(exc)[:140]}).")
+        reason = f"{type(exc).__name__}: {str(exc)[:220]}"
+        result.info["fallback_reason"] = reason
+        result.warnings.append(f"Live catalog unavailable ({reason}).")
         if not allow_synthetic_fallback:
             raise
         result.info["source"] = "synthetic-fallback"
@@ -436,6 +633,8 @@ def fetch_roi_imagery(bbox: Sequence[float], start: date, end: date,
             "Serving a deterministic synthetic scene rendered to the requested ROI extent; "
             "all analyses run identically on it."
         )
+    if future_note:
+        result.warnings.append(future_note)
     return result
 
 

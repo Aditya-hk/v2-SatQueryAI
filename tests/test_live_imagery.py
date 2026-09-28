@@ -1,8 +1,11 @@
 """Unit tests for the live map / ROI acquisition utilities.
 
-The sandbox has no outbound network, so the STAC path is mocked. The tests pin
-down: bbox validation, window geometry, the deterministic synthetic fallback
-(what judges see offline), GeoTIFF/GeoJSON exports, and the map builder.
+The suite is hermetic: an autouse fixture makes the STAC catalog unreachable,
+and tests that exercise the live path install their own window-aware fake
+catalog (patching after the fixture runs). The tests pin down: bbox validation,
+window geometry, search escalation (widen / relax cloud / force a bi-temporal
+pair), the deterministic synthetic fallback, GeoTIFF/GeoJSON exports, and the
+map builder.
 """
 
 from __future__ import annotations
@@ -28,6 +31,19 @@ from satquery.utils.live_imagery import (
 )
 
 BBOX = (77.30, 28.35, 77.42, 28.45)  # ~11 x 11 km over Delhi
+
+
+@pytest.fixture(autouse=True)
+def _offline_catalog(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the suite hermetic — no real STAC traffic.
+
+    Tests that want the live path patch the catalog themselves; their
+    ``monkeypatch.setattr`` runs after this fixture and therefore wins.
+    """
+    def offline() -> None:
+        raise ConnectionError("offline test sandbox")
+
+    monkeypatch.setattr("satquery.utils.live_imagery._mpc_catalog", offline)
 
 
 def _fallback_pair(include_sar: bool = False, max_dim: int = 128):
@@ -101,40 +117,183 @@ class _FakeSearch:
 
 
 class _FakeCatalog:
+    """STAC stand-in that honours bbox/cloud filters and the datetime window."""
+
     def __init__(self, items: list) -> None:
         self._items = items
         self.seen: list = []
 
     def search(self, **kwargs) -> _FakeSearch:
         self.seen.append(kwargs)
-        return _FakeSearch(self._items)
+        start_s, _, end_s = str(kwargs.get("datetime", "")).partition("/")
+        lo = dt.date.fromisoformat(start_s) if start_s else dt.date.min
+        hi = dt.date.fromisoformat(end_s) if end_s else dt.date.max
+        query = kwargs.get("query") or {}
+        cap = None
+        if "eo:cloud_cover" in query:
+            cap = float(query["eo:cloud_cover"].get("lt", 100.0))
+        hits = []
+        for item in self._items:
+            day = dt.date.fromisoformat(str(item.properties["datetime"])[:10])
+            if not (lo <= day <= hi):
+                continue
+            clouds = item.properties.get("eo:cloud_cover")
+            if cap is not None and clouds is not None and float(clouds) >= cap:
+                continue
+            hits.append(item)
+        return _FakeSearch(hits)
+
+
+def _fake_read(href: str, bbox: tuple, out_h: int, out_w: int) -> np.ndarray:
+    assert bbox == BBOX
+    rng = np.random.default_rng(abs(hash(href)) % 2**32)
+    return rng.random((out_h, out_w)).astype(np.float32)
+
+
+def _install(monkeypatch: pytest.MonkeyPatch, items: list) -> _FakeCatalog:
+    catalog = _FakeCatalog(items)
+    monkeypatch.setattr("satquery.utils.live_imagery._mpc_catalog", lambda: catalog)
+    monkeypatch.setattr("satquery.utils.live_imagery._read_asset_window", _fake_read)
+    return catalog
+
+
+def _acq(img) -> dict:
+    return img.metadata.extra["acquisition"]
 
 
 def test_live_path_reads_and_signs_windows(monkeypatch: pytest.MonkeyPatch) -> None:
-    item = _FakeItem("S2_test_scene", "2024-01-10T05:12:00Z", 12.0)
-    catalog = _FakeCatalog([item])
-    monkeypatch.setattr("satquery.utils.live_imagery._mpc_catalog", lambda: catalog)
+    catalog = _install(monkeypatch, [
+        _FakeItem("S2_jan_scene", "2024-01-03T05:12:00Z", 12.0),
+        _FakeItem("S2_sep_scene", "2024-09-18T05:12:00Z", 4.0),
+    ])
 
-    def fake_read(href: str, bbox: tuple, out_h: int, out_w: int) -> np.ndarray:
-        assert bbox == BBOX
-        rng = np.random.default_rng(abs(hash(href)) % 2**32)
-        return rng.random((out_h, out_w)).astype(np.float32)
-
-    monkeypatch.setattr("satquery.utils.live_imagery._read_asset_window", fake_read)
-
-    res = fetch_roi_imagery(BBOX, dt.date(2024, 1, 1), dt.date(2024, 1, 20),
+    res = fetch_roi_imagery(BBOX, dt.date(2024, 1, 1), dt.date(2024, 9, 20),
                             include_sar=False, max_dim=128)
     assert res.info["source"].startswith("planetary-computer")
     assert "scenes" in res.info and "sar_scene" not in res.info
     assert len(res.images) == 2
+    # one search per epoch: the requested ±7-day windows both had a scene, so
+    # nothing had to escalate
+    assert len(catalog.seen) == 2
+    assert [kw["collections"] for kw in catalog.seen] == [["sentinel-2-l2a"]] * 2
+    assert [str(_acq(img)["scene_id"]) for img in res.images] == ["S2_jan_scene", "S2_sep_scene"]
     for img in res.images:
         assert img.data.shape[1:] == (128, 4)  # B04,B03,B02,B08 stretched (R,G,B,NIR)
-        acq = img.metadata.extra["acquisition"]
-        assert acq["scene_id"] == "S2_test_scene"
-        assert acq["cloud_cover"] == pytest.approx(12.0)
-    # the search was constrained to the two request windows
-    assert len(catalog.seen) == 2
-    assert all(kw["collections"] == ["sentinel-2-l2a"] for kw in catalog.seen)
+        assert _acq(img)["widened"] is False
+        assert _acq(img)["cloud_filter"] == pytest.approx(30.0)
+    assert _acq(res.images[0])["cloud_cover"] == pytest.approx(12.0)
+
+
+def test_search_widens_when_the_requested_window_is_empty(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The old code gave up here and served a synthetic scene."""
+    catalog = _install(monkeypatch, [
+        _FakeItem("S2_jan_scene", "2024-01-03T05:12:00Z", 5.0),
+        _FakeItem("S2_distant", "2024-03-01T05:12:00Z", 3.0),
+    ])
+    res = fetch_roi_imagery(BBOX, dt.date(2024, 1, 1), dt.date(2024, 4, 25),
+                            include_sar=False, max_dim=128)
+    assert res.info["source"].startswith("planetary-computer")
+    t2 = _acq(res.images[1])
+    assert t2["scene_id"] == "S2_distant"
+    assert t2["widened"] is True
+    assert t2["days_from_target"] > 7
+    assert any("no usable scene within" in w for w in res.warnings), res.warnings
+    assert catalog.seen, "the search must have been attempted"
+
+
+def test_cloud_threshold_is_relaxed_before_widening(monkeypatch: pytest.MonkeyPatch) -> None:
+    catalog = _install(monkeypatch, [
+        _FakeItem("S2_jan_scene", "2024-01-03T05:12:00Z", 9.0),
+        _FakeItem("S2_cloudy", "2024-09-18T05:12:00Z", 88.0),
+    ])
+    res = fetch_roi_imagery(BBOX, dt.date(2024, 1, 1), dt.date(2024, 9, 20),
+                            include_sar=False, max_dim=128)
+    assert res.info["source"].startswith("planetary-computer")
+    t2 = _acq(res.images[1])
+    assert t2["scene_id"] == "S2_cloudy"
+    assert t2["widened"] is False                      # same ±7-day window
+    assert t2["cloud_filter"] is None                   # cloud cap dropped
+    assert t2["cloud_cover"] == pytest.approx(88.0)
+    assert any("cloud threshold relaxed" in w for w in res.warnings), res.warnings
+    assert any("accepted 88% cloud cover" in w for w in res.warnings), res.warnings
+
+
+def test_bi_temporal_pair_is_forced_onto_distinct_scenes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Both epochs score the same scene highest; T2 must be re-picked.
+
+    ``S2_clear`` is clear enough to outrank the nearer but 88%-cloudy
+    ``S2_cloudy`` for *both* target dates, so the pair would collapse onto one
+    acquisition without the distinct-scene guard.
+    """
+    _install(monkeypatch, [
+        _FakeItem("S2_clear", "2024-03-15T05:12:00Z", 5.0),
+        _FakeItem("S2_cloudy", "2024-03-20T05:12:00Z", 88.0),
+    ])
+    res = fetch_roi_imagery(BBOX, dt.date(2024, 1, 1), dt.date(2024, 6, 1),
+                            include_sar=False, max_dim=128)
+    assert res.info["source"].startswith("planetary-computer")
+    ids = [str(_acq(img)["scene_id"]) for img in res.images]
+    assert len(set(ids)) == 2, ids
+    assert any("re-picked" in w for w in res.warnings), res.warnings
+
+
+def test_single_scene_roi_warns_but_still_returns_a_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, [_FakeItem("S2_only", "2024-04-01T05:12:00Z", 6.0)])
+    res = fetch_roi_imagery(BBOX, dt.date(2024, 1, 1), dt.date(2024, 6, 1),
+                            include_sar=False, max_dim=128)
+    assert res.info["source"].startswith("planetary-computer")
+    assert len(res.images) == 2
+    assert any("same scene" in w for w in res.warnings), res.warnings
+
+
+def test_sar_failure_degrades_to_the_optical_pair(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, [
+        _FakeItem("S2_jan_scene", "2024-01-03T05:12:00Z", 9.0),
+        _FakeItem("S2_sep_scene", "2024-09-18T05:12:00Z", 4.0),
+    ])
+
+    def no_sar(*args, **kwargs):
+        raise RuntimeError("VV asset missing from scene S1_test")
+
+    monkeypatch.setattr("satquery.utils.live_imagery._fetch_sar_live", no_sar)
+    res = fetch_roi_imagery(BBOX, dt.date(2024, 1, 1), dt.date(2024, 9, 20),
+                            include_sar=True, max_dim=128)
+    assert res.info["source"].startswith("planetary-computer"), res.warnings
+    assert len(res.images) == 2, "the optical pair must survive a SAR failure"
+    assert any("SAR acquisition failed" in w for w in res.warnings), res.warnings
+
+
+def test_future_window_is_rejected_with_a_clear_message() -> None:
+    start = dt.date.today() + dt.timedelta(days=5)
+    with pytest.raises(ValueError, match="future"):
+        fetch_roi_imagery(BBOX, start, start + dt.timedelta(days=10))
+
+
+def test_future_end_date_is_clamped(monkeypatch: pytest.MonkeyPatch) -> None:
+    _install(monkeypatch, [
+        _FakeItem("S2_jan_scene", "2024-01-03T05:12:00Z", 9.0),
+        _FakeItem("S2_recent", f"{dt.date.today().isoformat()}T05:12:00Z", 4.0),
+    ])
+    today = dt.date.today()
+    res = fetch_roi_imagery(BBOX, today - dt.timedelta(days=60),
+                            today + dt.timedelta(days=30), include_sar=False,
+                            max_dim=128)
+    assert any("clamped" in w for w in res.warnings), res.warnings
+    assert res.info["end"] == today.isoformat()
+
+
+def test_empty_catalog_escalates_fully_then_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    catalog = _install(monkeypatch, [])
+    res = fetch_roi_imagery(BBOX, dt.date(2024, 1, 1), dt.date(2024, 1, 20))
+    assert res.info["source"] == "synthetic-fallback"
+    # both epochs escalate through every step before the synthetic fallback
+    assert len(catalog.seen) == 12, [kw["datetime"] for kw in catalog.seen]
+    widths = [str(kw["datetime"]) for kw in catalog.seen]
+    assert widths[0] != widths[-1], "windows must progressively widen"
+    assert any("query" not in kw for kw in catalog.seen), \
+        "the cloud threshold must be dropped at some point"
+    assert res.info.get("fallback_reason"), "the reason must reach the audit trail"
+    assert any("±365" in w for w in res.warnings), res.warnings
 
 
 def test_live_path_empty_result_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
